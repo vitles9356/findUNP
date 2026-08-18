@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Рабочие данные
+*.xlsx
+*.xls
+*.csv
+
+# Кэш
+unp_cache.json
+
+# Архив старых версий
+Arhiv/
+
+# Virtual environment
+.venv/
+
+# VS Code
+.vscode/
+# Microsoft Office temporary files
+~$*
+*.tmp
