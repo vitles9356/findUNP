@@ -762,9 +762,13 @@ def make_rows(records, cache_path="unp_cache.json"):
                     f"Статус={candidate.get('status', '')}"
                 )
 
+            # decision = (
+            #     "manual_multiple: "
+            #    + "; ".join(candidate_text)
+            #)
             decision = (
-                "manual_multiple: "
-                + "; ".join(candidate_text)
+                "manual_multiple:\n"
+                + "\n".join(candidate_text)
             )
 
             unp = ""
