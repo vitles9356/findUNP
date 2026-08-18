@@ -637,26 +637,30 @@ def make_rows(records, cache_path="unp_cache.json"):
       Ликвидированные организации не исключаются.
       Несколько кандидатов -> manual_multiple.
       Найденное название: ИП=VFIO, ЮЛ=VN.
+
+    В результат сохраняются:
+      - исходное название;
+      - поисковый запрос;
+      - кандидаты для manual_multiple в поле "Решение".
     """
     cache = load_cache(cache_path)
     rows = []
 
     for rec in records:
-        # print("Тип rec:", type(rec), "Содержимое:", rec) # Временная строка для отладки
         row_number, record_id, tip_org, name = rec
-        tip_org = str(tip_org or "").strip().upper()
-        name = str(name or "").strip()       
-        # row_number = rec.get("row_number", "")
-        # record_id = rec.get("id", "")      
-        # tip_org = str(rec.get("tip_org", "") or "").strip().upper()
-        # name = str(rec.get("org_name", "") or "").strip()
 
+        tip_org = str(tip_org or "").strip().upper()
+        name = str(name or "").strip()
+
+        # ---------------------------------------------------------
         # Пустое наименование
+        # ---------------------------------------------------------
         if not name:
             rows.append({
                 "ID": record_id,
                 "TIP_ORG": tip_org,
-                "ORG_NAME": name,
+                "Исходное название": name,
+                "Поисковый запрос": "",
                 "УНП": "",
                 "Найденное название": "",
                 "Статус": "",
@@ -666,14 +670,17 @@ def make_rows(records, cache_path="unp_cache.json"):
             })
             continue
 
-        # Физическое лицо: УНП не ищем.
+        # ---------------------------------------------------------
+        # Физическое лицо: УНП не ищем
+        # ---------------------------------------------------------
         if tip_org == "ФЛ":
             inn_search(name)
 
             rows.append({
                 "ID": record_id,
                 "TIP_ORG": tip_org,
-                "ORG_NAME": name,
+                "Исходное название": name,
+                "Поисковый запрос": "",
                 "УНП": "",
                 "Найденное название": "",
                 "Статус": "",
@@ -683,14 +690,17 @@ def make_rows(records, cache_path="unp_cache.json"):
             })
             continue
 
+        # ---------------------------------------------------------
         # ЮЛ / ИП
+        # ---------------------------------------------------------
         search_query = normalize(name, tip_org)
 
         if not search_query:
             rows.append({
                 "ID": record_id,
                 "TIP_ORG": tip_org,
-                "ORG_NAME": name,
+                "Исходное название": name,
+                "Поисковый запрос": search_query,
                 "УНП": "",
                 "Найденное название": "",
                 "Статус": "",
@@ -700,7 +710,9 @@ def make_rows(records, cache_path="unp_cache.json"):
             })
             continue
 
+        # ---------------------------------------------------------
         # Кэш
+        # ---------------------------------------------------------
         cache_key = f"{tip_org}|{search_query}"
 
         if cache_key in cache:
@@ -711,38 +723,74 @@ def make_rows(records, cache_path="unp_cache.json"):
             cache[cache_key] = candidates
             source = "запрос ЕГР"
 
-        # Выбор
+        # ---------------------------------------------------------
+        # Выбор кандидата
+        # ---------------------------------------------------------
         best, score, ranked = best_match(
             name,
             candidates,
             tip_org
         )
 
+        # ---------------------------------------------------------
+        # Однозначно найден кандидат
+        # ---------------------------------------------------------
         if best is not None:
-            decision = "auto"
+            # Решение зависит от балла:
+            # >= SCORE_ACCEPT -> auto
+            # >= SCORE_REVIEW -> review
+            # иначе -> low
+            decision = decide(score)
+
             unp = best.get("unp", "")
             found_name = best.get("name", "")
             status = best.get("status", "")
             result_score = best.get("score", score)
 
+        # ---------------------------------------------------------
+        # Несколько кандидатов
+        # ---------------------------------------------------------
         elif ranked:
-            decision = "manual_multiple"
+            candidate_text = []
+
+            for i, candidate in enumerate(ranked, start=1):
+                candidate_text.append(
+                    f"{i}) "
+                    f"УНП={candidate.get('unp', '')} | "
+                    f"Название={candidate.get('name', '')} | "
+                    f"Балл={candidate.get('score', 0)} | "
+                    f"Статус={candidate.get('status', '')}"
+                )
+
+            decision = (
+                "manual_multiple: "
+                + "; ".join(candidate_text)
+            )
+
             unp = ""
             found_name = ""
             status = ""
             result_score = score
 
+        # ---------------------------------------------------------
+        # Ничего не найдено
+        # ---------------------------------------------------------
         else:
             decision = "not_found"
+
             unp = ""
             found_name = ""
             status = ""
             result_score = 0.0
 
+        # ---------------------------------------------------------
+        # Итоговая строка
+        # ---------------------------------------------------------
         rows.append({
             "ID": record_id,
             "TIP_ORG": tip_org,
-            "ORG_NAME": name,
+            "Исходное название": name,
+            "Поисковый запрос": search_query,
             "УНП": unp,
             "Найденное название": found_name,
             "Статус": status,
@@ -752,6 +800,7 @@ def make_rows(records, cache_path="unp_cache.json"):
         })
 
     save_cache(cache_path, cache)
+
     return rows
 
 def test_single_record(records, row_number, cache_path="unp_cache.json"):
@@ -943,11 +992,22 @@ def write_excel(rows, output):
     from collections import Counter
 
     # counter = Counter(row[8] for row in rows)
-    counter = Counter(row["Решение"] for row in rows)
+    # counter = Counter(row["Решение"] for row in rows)
+    
+    counter = Counter()
+
+    for row in rows:
+        decision = row["Решение"]
+
+        if decision.startswith("manual_multiple"):
+            decision = "manual_multiple"
+
+        counter[decision] += 1
+    
     summary.append(["Решение", "Количество", "Доля"])
     total = len(rows)
 
-    for key in ("auto", "review", "low", "not_found", "empty_name", "error"):
+    for key in ("auto", "review", "low", "manual_multiple", "not_found", "empty_name", "error"):
         if counter[key]:
             summary.append([
                 key,
