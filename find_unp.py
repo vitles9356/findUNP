@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Автоматический поиск УНП организаций и ИП (Беларусь) по названию.
+Автоматический поиск УНП/регномера организаций и ИП (Беларусь) по названию.
 
 Источник данных: открытый API Единого государственного регистра юридических
 лиц и индивидуальных предпринимателей (ЕГР) — https://www.egr.gov.by/
@@ -30,6 +30,15 @@ egr.gov.by (например, из белорусской сети). Испол�
     python find_unp.py input.xlsx --column name --output result.xlsx
     python find_unp.py input.csv  --column 1            --output result.xlsx
     python find_unp.py input.xlsx --column name --probe     # отладка одного запроса
+
+
+API взят из New_egr_API.docx:
+    http://egr.gov.by/api/v2/egr/getShortInfoByRegName/{name}
+
+ВАЖНО:
+В предоставленном описании API поле называется NGRN — "Регистрационный номер".
+Документ не использует термин "УНП". Поэтому результат помечается как
+"УНП (NGRN)", чтобы не выдавать предположение за название поля API.
 """
 
 import argparse
@@ -39,251 +48,480 @@ import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote
 
-try:
-    import requests
-except ImportError:
-    sys.exit("Установите requests:  pip install requests")
-
-try:
-    from rapidfuzz import fuzz
-except ImportError:
-    sys.exit("Установите rapidfuzz:  pip install rapidfuzz")
-
-try:
-    import openpyxl
-    from openpyxl.styles import Font, PatternFill, Alignment
-except ImportError:
-    sys.exit("Установите openpyxl:  pip install openpyxl")
+import requests
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from rapidfuzz import fuzz
 
 
-# --------------------------------------------------------------------------
-# Конфигурация API ЕГР
-# --------------------------------------------------------------------------
-# Основной (и запасной) эндпоинты поиска по наименованию. Если основной
-# недоступен/изменился — скрипт перебирает варианты по очереди.
-EGR_API_ENDPOINTS = [
-    "https://www.egr.gov.by/api/v2/ons/getRegisteredList?name={name}",
-    "https://www.egr.gov.by/egr2api/api/v1/ons?searchType=name&searchValue={name}",
-]
-EGR_TIMEOUT = 25
-EGR_DELAY = 0.4      # пауза между запросами, сек
+EGR_BASE_URL = "http://egr.gov.by/api/v2/egr"
+EGR_SEARCH_URL = EGR_BASE_URL + "/getShortInfoByRegName/{name}"
+
+EGR_TIMEOUT = 30
+EGR_DELAY = 0.5
 EGR_RETRIES = 3
 
-SCORE_ACCEPT = 92     # >= → auto
-SCORE_REVIEW = 70     # >= и < ACCEPT → review
+SCORE_ACCEPT = 92
+SCORE_REVIEW = 70
 
-
-# --------------------------------------------------------------------------
-# Нормализация названий
-# --------------------------------------------------------------------------
-_LEGAL_FORMS = [
-    "ооо", "зоу", "зоо", "зао", "оао", "иу", "оу", "коу", "мп", "чуп", "чтуп",
-    "ип", "общество с ограниченной ответственностью",
-    "закрытое акционерное общество", "открытое акционерное общество",
-    "частное унитарное предприятие", "коммунальное унитарное предприятие",
+LEGAL_FORMS = [
+    "ооо",
+    "чтуп",
+    "оао",
+    "ип",
+    "чуп",
+    "одо",
+    "чп",
+    "чтпуп",
+    "зао",
+    "чпуп",
+    "иооо",
+    "уп",
+    "руп",
+    "пк",
+    "пуп",
+    "чтсуп",
+    "киуп",
+    "куп",
+    "птчуп",
+    "сба засо",
+    "мо оао",
+    "тп",
+    "туп",
+    "уз",
+    "уо",
+    "утк",
+    "учтпп",
+    "учтп",
+    "чптуп",
+    "чсуп",
+    "чткп",
+    "сооо",
+    "мукп",
+    "филиал зао",
+    "филиал оао",
+    "филиал",
+    "частное предприятие",
+    "общество с ограниченной ответственностью",
+    "закрытое акционерное общество",
+    "открытое акционерное общество",
+    "частное унитарное предприятие",
+    "коммунальное унитарное предприятие",
 ]
-_QUOTE_RE = re.compile(r'[«»“”\'"`]')
-_WS_RE = re.compile(r"\s+")
+"""
+QUOTE_RE = Quote Regular Expression (Регулярное выражение для кавычек)
+-Эта строка находит все виды кавычек в тексте
+WS_RE = Whitespace Regular Expression (Регулярное выражение для пробельных символов)
+-Эта строка находит любые последовательности пробельных символов
+"""
+QUOTE_RE = re.compile(r'[«»“”\'"`]')
+WS_RE = re.compile(r"\s+")
 
+def debug_ip_candidates(input_name, candidates):
+    """
+    Диагностика сопоставления ИП по фамилии и инициалам.
 
-def normalize(name: str) -> str:
+    Ничего не выбирает и не изменяет.
+    Показывает, как исходное ФИО и каждый кандидат
+    разбираются на фамилию и инициалы.
+    """
+
+    def fio_parts(value):
+        if not value:
+            return "", ""
+
+        s = str(value).strip().lower().replace("ё", "е")
+        s = re.sub(r"\s+", " ", s)
+
+        words = s.replace(",", " ").split()
+
+        if not words:
+            return "", ""
+
+        surname = words[0]
+        initials = ""
+
+        for word in words[1:]:
+            # Слово состоит из инициалов:
+            # "т.в.", "т. в.", "т.в"
+            if "." in word:
+                letters = re.findall(r"[а-яa-z]", word)
+                initials += "".join(letters)
+                continue
+
+            # Полное имя/отчество:
+            # "татьяна" -> т
+            # "викторовна" -> в
+            letters = re.findall(r"[а-яa-z]", word)
+
+            if letters:
+                initials += letters[0]
+
+        return surname, initials
+
+    input_surname, input_initials = fio_parts(input_name)
+
+    print("=" * 80)
+    print("ДИАГНОСТИКА КАНДИДАТОВ ИП")
+    print("=" * 80)
+
+    print(f"Исходное ФИО : {input_name}")
+    print(f"Фамилия      : {input_surname}")
+    print(f"Инициалы     : {input_initials}")
+    print(f"Кандидатов   : {len(candidates)}")
+    print()
+
+    matches = []
+
+    for i, candidate in enumerate(candidates, start=1):
+
+        vfio = candidate.get("vfio", "") or ""
+
+        # ЮЛ среди результатов ИП нам неинтересны.
+        if not vfio:
+            continue
+
+        surname, initials = fio_parts(vfio)
+
+        surname_match = surname == input_surname
+        initials_match = initials == input_initials
+
+        if surname_match and initials_match:
+            match = "ФАМИЛИЯ + ИНИЦИАЛЫ"
+            matches.append(candidate)
+
+        elif surname_match:
+            match = "ТОЛЬКО ФАМИЛИЯ"
+
+        else:
+            match = ""
+
+        # Показываем только кандидатов с совпадающей фамилией. Остальные не представляют интереса.
+        if surname_match:
+            print(
+                f"{len(matches):>2}. "
+                f"УНП={candidate.get('unp', '')} | "
+                f"ФИО={vfio}"
+            )
+            print(
+                f"    Фамилия: {surname} | "
+                f"Инициалы: {initials} | "
+                f"{match} | "
+                f"Статус: {candidate.get('status', '')}"
+            )
+
+    print()
+    print("-" * 80)
+    print(f"Совпадений фамилии + инициалов: {len(matches)}")
+    print("-" * 80)
+
+    if matches:
+        for i, candidate in enumerate(matches, start=1):
+            print(
+                f"{i}. "
+                f"УНП={candidate.get('unp', '')} | "
+                f"ФИО={candidate.get('vfio', '')} | "
+                f"Статус={candidate.get('status', '')}"
+            )
+    else:
+        print("Точных совпадений по фамилии + инициалам нет.")
+
+    print("=" * 80)
+
+    return matches
+def normalize(name, tip_org):
+    """Нормализация поискового запроса."""
     if not name:
         return ""
-    s = name.lower().strip()
-    s = s.replace("ё", "е")
-    s = _QUOTE_RE.sub(" ", s)
-    s = _WS_RE.sub(" ", s).strip()
-    for lf in _LEGAL_FORMS:
+
+    s = str(name).lower().strip().replace("ё", "е")
+    s = QUOTE_RE.sub(" ", s)
+
+    # Отбрасываем правовые формы.
+    for lf in LEGAL_FORMS:
         s = re.sub(rf"\b{re.escape(lf)}\b", " ", s)
-    s = re.sub(r"[^\w\s-]", " ", s)
-    s = _WS_RE.sub(" ", s).strip()
-    return s
 
+    s = re.sub(r"[^\w\s.-]", " ", s, flags=re.UNICODE)
+    s = WS_RE.sub(" ", s).strip()
 
-# --------------------------------------------------------------------------
-# Парсер ответа ЕГР (толерантный к схеме)
-# --------------------------------------------------------------------------
-_UNP_RE = re.compile(r"\b\d{9}\b")
+    # Для ИП: первое слово — фамилия; инициалы после фамилии отбрасываем.
+    if str(tip_org).strip().upper() == "ИП":
+        words = s.split()
+        if words:
+            result = [words[0]]
+            for word in words[1:]:
+                # Инициал: одна буква, возможно с точкой.
+                if len(word.replace(".", "")) <= 1:
+                    continue
+                # Сочетание инициалов также отбрасываем.
+                if all(len(part) == 1 for part in word.split(".") if part):
+                    continue
+                result.append(word)
+            s = " ".join(result)
 
+    return s.strip()
 
-def _find_unp_number(v):
-    """Извлечь 9-значный УНП из значения любого типа (строка/число/список)."""
-    if isinstance(v, list):
-        for item in v:
-            r = _find_unp_number(item)
-            if r:
-                return r
-        return None
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, int):
-        s = str(v)
-        if len(s) == 9 and s.isdigit():
-            return s
-        m = _UNP_RE.search(s)
-        return m.group() if m else None
-    if isinstance(v, str):
-        m = _UNP_RE.search(v)
-        return m.group() if m else None
-    return None
-
-
-def _extract_candidates(obj):
-    """Рекурсивно собрать из произвольного JSON список словарей-кандидатов.
-
-    Каждый кандидат — dict, содержащий хотя бы одно поле-УНП (9 цифр) и
-    хотя бы одно строковое поле с наименованием. list[dict].
-    """
-    candidates = []
-
-    def walk(node):
-        if isinstance(node, dict):
-            unp = None
-            name = None
-            # 1) УНП в полях с «ключевым» именем
-            for k, v in node.items():
-                ks = str(k).lower()
-                if any(t in ks for t in ("unp", "vnum", "inu", "inn", "regnum",
-                                         "reg_num", "nomer", "номер", "учетн",
-                                         "учн", "ogr", "payer")):
-                    r = _find_unp_number(v)
-                    if r and unp is None:
-                        unp = r
-            # 2) иначе — любое поле со значением, похожим на УНП
-            if unp is None:
-                for v in node.values():
-                    r = _find_unp_number(v)
-                    if r:
-                        unp = r
-                        break
-            def _first_str(v):
-                """Достать первую непустую строку (в т.ч. из списка)."""
-                if isinstance(v, str):
-                    return v.strip() if v.strip() else None
-                if isinstance(v, list):
-                    for it in v:
-                        r = _first_str(it)
-                        if r:
-                            return r
-                return None
-            # 3) наименование по ключевому имени поля
-            for k, v in node.items():
-                ks = str(k).lower()
-                if any(t in ks for t in ("name", "naim", "vnaim", "naimp",
-                                         "naimov", "polnoe", "полное",
-                                         "наименов", "fulln", "firm", "nazv")):
-                    r = _first_str(v)
-                    if r and len(r) > 2:
-                        name = r
-                        break
-            # 4) иначе — самая длинная строка в этом dict (в т.ч. внутри списков)
-            if name is None:
-                all_strs = []
-                for v in node.values():
-                    if isinstance(v, str) and len(v) > 3 and not v.isdigit():
-                        all_strs.append(v.strip())
-                    elif isinstance(v, list):
-                        for it in v:
-                            if isinstance(it, str) and len(it) > 3 and not it.isdigit():
-                                all_strs.append(it.strip())
-                if all_strs:
-                    name = max(all_strs, key=len).strip()
-            if unp and name:
-                status = None
-                for k, v in node.items():
-                    ks = str(k).lower()
-                    if isinstance(v, str) and any(t in ks for t in
-                                                 ("status", "sost", "состоян", "сост")):
-                        status = v.strip()
-                        break
-                # не используем в качестве name технические поля
-                if name.lower() not in ("действует", "ликвидирован", "активно"):
-                    candidates.append({"unp": unp, "name": name,
-                                       "status": status, "raw": node})
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(obj)
-    return candidates
-
-
-# --------------------------------------------------------------------------
-# Поиск в ЕГР
-# --------------------------------------------------------------------------
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ru-RU,ru;q=0.9",
-})
-
-
-def egr_search(name: str, debug=False):
-    """Вернуть список кандидатов (dict) из ЕГР по названию."""
-    enc = quote_plus(name)
-    last_text = None
-    for url_tmpl in EGR_API_ENDPOINTS:
-        url = url_tmpl.format(name=enc)
-        for attempt in range(1, EGR_RETRIES + 1):
-            try:
-                r = _session.get(url, timeout=EGR_TIMEOUT)
-                if r.status_code == 200:
-                    try:
-                        data = r.json()
-                    except ValueError:
-                        last_text = r.text[:1000]
-                        break
-                    if debug:
-                        print(f"\n[probe] {url}\nstatus=200\nraw:\n"
-                              f"{json.dumps(data, ensure_ascii=False)[:2000]}\n",
-                              flush=True)
-                    cands = _extract_candidates(data)
-                    if cands:
-                        return cands
-                    last_text = json.dumps(data, ensure_ascii=False)[:1000]
-                    break
-                else:
-                    last_text = f"HTTP {r.status_code}: {r.text[:300]}"
-                    if r.status_code == 404:
-                        break
-            except requests.RequestException as e:
-                last_text = str(e)
-                time.sleep(1.0 * attempt)
-    if debug:
-        print(f"[probe] кандидаты не найдены. last={last_text}", flush=True)
+def _as_dict_list(data):
+    """Привести разные варианты JSON-ответа к списку словарей."""
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        # Частые варианты: {"content": [...]}, {"data": [...]}, {"result": [...]}
+        for key in ("content", "data", "result", "items", "rows", "list"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+            if isinstance(value, dict):
+                nested = _as_dict_list(value)
+                if nested:
+                    return nested
+        return [data]
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
     return []
 
 
-# --------------------------------------------------------------------------
-# Сопоставление
-# --------------------------------------------------------------------------
-def best_match(input_name: str, candidates):
-    norm_in = normalize(input_name)
-    best = None
-    best_score = -1.0
-    for c in candidates:
-        score = fuzz.token_sort_ratio(norm_in, normalize(c["name"]))
-        if score > best_score:
-            best_score = score
-            best = c
-    if best is None:
+def parse_egr_response(data):
+    """
+    Парсер именно схемы из New_egr_API.docx:
+      ngrn   — регистрационный номер
+      nsi00219 — состояние
+      vfio   — ФИО ИП
+      vnaim  — полное наименование ЮЛ
+      vn     — сокращенное наименование ЮЛ
+      vfn    — фирменное наименование ЮЛ
+    """
+    candidates = []
+    for item in _as_dict_list(data):
+        ngrn = item.get("ngrn", item.get("NGRN"))
+        if ngrn is None:
+            continue
+
+        # API описывает ngrn как integer; сохраняем ведущие нули, если сервер
+        # неожиданно вернул его строкой.
+        ngrn = str(ngrn).strip()
+        if not re.fullmatch(r"\d{1,12}", ngrn):
+            continue
+
+        status = item.get("nsi00219", item.get("NSI00219"))
+        if isinstance(status, dict):
+            status = (
+                status.get("vnsostk")
+                or status.get("VNSOSTK")
+                or status.get("nksost")
+                or status.get("NKSOST")
+                or str(status)
+            )
+
+        vfio = item.get("vfio", item.get("VFIO"))
+        vn = item.get("vn", item.get("VN"))
+        vnaim = item.get("vnaim", item.get("VNAIM"))
+        vfn = item.get("vfn", item.get("VFN"))
+
+        # Сохраняем отдельные поля API.
+        # Для ИП при сопоставлении и выводе используем VFIO,
+        # для ЮЛ — VN (сокращенное наименование).
+        if vfio or vn or vnaim or vfn:
+            candidates.append({
+                "unp": ngrn,
+                "vfio": "" if vfio is None else str(vfio).strip(),
+                "vn": "" if vn is None else str(vn).strip(),
+                "vnaim": "" if vnaim is None else str(vnaim).strip(),
+                "vfn": "" if vfn is None else str(vfn).strip(),
+                "status": "" if status is None else str(status).strip(),
+                "raw": item,
+            })
+    return candidates
+
+
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/151.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+})
+
+
+def egr_search(name, debug=False):
+    # Для path-параметра используем quote, а не quote_plus:
+    # пробел должен передаваться как %20, а не как '+'.
+    # debug=True — это инструмент разработчика
+    # Статусы 204 (No Content) и 404 (Not Found)
+    encoded = quote(str(name), safe="")
+    url = EGR_SEARCH_URL.format(name=encoded)
+    last_error = None
+
+    for attempt in range(1, EGR_RETRIES + 1):
+        try:
+            response = _session.get(url, timeout=EGR_TIMEOUT)
+
+            if debug:
+                print("URL:", response.url)
+                print("HTTP:", response.status_code)
+                print("RAW:", response.text[:3000])
+
+            if response.status_code == 204:
+                return []
+
+            if response.status_code == 404:
+                return []
+
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                except ValueError:
+                    raise RuntimeError(
+                        "HTTP 200, но тело ответа не является JSON: "
+                        + response.text[:500]
+                    )
+                candidates = parse_egr_response(data)
+                if debug:
+                    print("CANDIDATES:", json.dumps(
+                        candidates, ensure_ascii=False, indent=2
+                    )[:5000])
+                return candidates
+
+            last_error = f"HTTP {response.status_code}: {response.text[:500]}"
+
+        except requests.RequestException as exc:
+            last_error = str(exc)
+
+        if attempt < EGR_RETRIES:
+            time.sleep(attempt)
+
+    raise RuntimeError(last_error or "Неизвестная ошибка запроса ЕГР")
+
+
+def candidate_name(candidate, tip_org):
+    """Название кандидата, используемое для сопоставления и вывода."""
+    tip_org = str(tip_org or "").strip().upper()
+
+    if tip_org == "ИП":
+        return candidate.get("vfio", "")
+    if tip_org == "ЮЛ":
+        return candidate.get("vn", "")
+
+    return ""
+
+
+def best_match(input_name, candidates, tip_org):
+    """
+    Выбор кандидата.
+
+    ИП:
+      - только VFIO;
+      - перед разбором ФИО удаляется правовая форма "ИП";
+      - строгое совпадение фамилии и инициалов;
+      - 0 -> not_found;
+      - 1 -> auto;
+      - >1 -> manual_multiple.
+
+    ЮЛ:
+      - существующий fuzzy-механизм по VN.
+    """
+    tip_org = str(tip_org or "").strip().upper()
+
+    if tip_org == "ИП":
+
+        def fio_parts(value):
+            if not value:
+                return "", ""
+
+            s = str(value).strip().lower().replace("ё", "е")
+            s = re.sub(r"\s+", " ", s)
+
+            # Для входного значения "ИП Вишнякова Т.В."
+            # удаляем правовую форму ИП перед разбором ФИО.
+            words = s.replace(",", " ").split()
+            if words and words[0] == "ип":
+                words = words[1:]
+
+            if not words:
+                return "", ""
+
+            surname = words[0]
+            initials = ""
+
+            for word in words[1:]:
+                # Готовые инициалы: Т.В., Т. В., Т.В
+                if "." in word:
+                    letters = re.findall(r"[а-яa-z]", word)
+                    initials += "".join(letters)
+                    continue
+
+                # Полное имя/отчество: Татьяна -> Т
+                letters = re.findall(r"[а-яa-z]", word)
+                if letters:
+                    initials += letters[0]
+
+            return surname, initials
+
+        input_surname, input_initials = fio_parts(input_name)
+        matched = []
+
+        for candidate in candidates:
+            vfio = candidate.get("vfio", "") or ""
+
+            if not vfio:
+                continue
+
+            candidate_surname, candidate_initials = fio_parts(vfio)
+
+            if (
+                candidate_surname == input_surname
+                and candidate_initials == input_initials
+            ):
+                matched.append({
+                    "unp": candidate.get("unp", ""),
+                    "name": vfio,
+                    "status": candidate.get("status", ""),
+                    "score": 100.0,
+                })
+
+        if not matched:
+            return None, 0.0, []
+
+        if len(matched) == 1:
+            return matched[0], 100.0, matched
+
+        # Несколько кандидатов: ничего автоматически не выбираем.
+        return None, 100.0, matched
+
+    # ЮЛ: существующий fuzzy-механизм по VN
+    norm_in = normalize(input_name, tip_org)
+    ranked = []
+
+    for candidate in candidates:
+        match_name = candidate_name(candidate, tip_org)
+
+        if not match_name:
+            continue
+
+        score = fuzz.token_sort_ratio(
+            norm_in,
+            normalize(match_name, tip_org)
+        )
+
+        ranked.append({
+            "unp": candidate.get("unp", ""),
+            "name": match_name,
+            "status": candidate.get("status", ""),
+            "score": round(score, 1),
+        })
+
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+
+    if not ranked:
         return None, 0.0, []
-    ranked = sorted(
-        [{"unp": c["unp"], "name": c["name"],
-          "score": round(fuzz.token_sort_ratio(norm_in, normalize(c["name"])), 1)}
-         for c in candidates],
-        key=lambda x: x["score"], reverse=True,
-    )[:5]
-    return best, round(best_score, 1), ranked
 
+    best = ranked[0]
+    return best, best["score"], ranked[:5]
 
-def decide(score: float) -> str:
+def decide(score):
     if score >= SCORE_ACCEPT:
         return "auto"
     if score >= SCORE_REVIEW:
@@ -291,189 +529,513 @@ def decide(score: float) -> str:
     return "low"
 
 
-# --------------------------------------------------------------------------
-# Чтение списка
-# --------------------------------------------------------------------------
-def _resolve_column(header, column):
-    if header is None:
-        return max(0, int(column) - 1)
+def _find_column(headers, column):
+    """Найти индекс столбца по имени или 1-based номеру."""
     if isinstance(column, str) and not column.isdigit():
-        for i, h in enumerate(header):
-            if h is not None and str(h).strip().lower() == column.strip().lower():
-                return i
-        raise SystemExit(f"Столбец «{column}» не найден. Заголовки: {header}")
+        matches = [
+            i for i, h in enumerate(headers)
+            if h.lower() == column.strip().lower()
+        ]
+        if not matches:
+            raise ValueError(
+                f"Столбец {column!r} не найден. Заголовки: {headers}"
+            )
+        return matches[0]
     return int(column) - 1
 
 
-def read_names(path: str, column):
+def read_names(
+    path,
+    id_column="id_r_raspost",
+    type_column="TIP_ORG",
+    name_column="ORG_NAME",
+):
+    """
+    Прочитать входной XLSX.
+
+    Возвращает ВСЕ строки с данными, включая строки с пустым ORG_NAME.
+    Для каждой строки возвращается:
+        (номер_строки_excel, ID, TIP_ORG, ORG_NAME)
+
+    Номер строки Excel сохраняется только для диагностики.
+    Основным идентификатором записи является id_r_raspost.
+    """
     p = Path(path)
-    names = []
-    if p.suffix.lower() in (".xlsx", ".xlsm"):
-        wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
-        ws = wb.active
-        rows = ws.iter_rows(values_only=True)
-        header = next(rows, None)
-        col_idx = _resolve_column(header, column)
-        for i, row in enumerate(rows, start=2):
-            val = row[col_idx] if col_idx < len(row) else None
-            if val is not None and str(val).strip():
-                names.append((i, str(val).strip()))
-    else:
-        with open(p, newline="", encoding="utf-8-sig") as f:
-            reader = csv.reader(f)
-            header = next(reader, None)
-            col_idx = _resolve_column(header, column)
-            for i, row in enumerate(reader, start=2):
-                val = row[col_idx] if col_idx < len(row) else None
-                if val and val.strip():
-                    names.append((i, val.strip()))
-    return names
+    if p.suffix.lower() not in (".xlsx", ".xlsm"):
+        raise ValueError("Для этой версии ожидается XLSX/XLSM")
 
-
-# --------------------------------------------------------------------------
-# Выгрузка в Excel
-# --------------------------------------------------------------------------
-_HEADER_FILL = PatternFill("solid", fgColor="305496")
-_HEADER_FONT = Font(color="FFFFFF", bold=True)
-_AUTO_FILL = PatternFill("solid", fgColor="C6EFCE")
-_REVIEW_FILL = PatternFill("solid", fgColor="FFEB9C")
-_LOW_FILL = PatternFill("solid", fgColor="FFC7CE")
-
-
-def write_excel(rows, out_path):
-    wb = openpyxl.Workbook()
+    wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
     ws = wb.active
-    ws.title = "УНП"
-    headers = ["№ строки", "Исходное название", "УНП", "Найденное название",
-               "Статус", "Балл", "Решение", "Кандидаты (УНП | название | балл)"]
-    ws.append(headers)
-    for c in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=c)
-        cell.fill = _HEADER_FILL
-        cell.font = _HEADER_FONT
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
-    for r in rows:
-        ws.append(r)
-        fill = {"auto": _AUTO_FILL, "review": _REVIEW_FILL,
-                "low": _LOW_FILL, "not_found": _LOW_FILL}.get(r[6], None)
-        if fill:
-            for c in range(1, len(headers) + 1):
-                ws.cell(row=ws.max_row, column=c).fill = fill
-    widths = [8, 52, 12, 52, 16, 8, 10, 60]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
-    ws.freeze_panes = "A2"
+    rows = ws.iter_rows(values_only=True)
+    header = next(rows, None)
+    if not header:
+        return []
 
-    ws2 = wb.create_sheet("Сводка")
-    from collections import Counter
-    cnt = Counter(r[6] for r in rows)
-    ws2.append(["Решение", "Кол-во", "Доля"])
-    for c in range(1, 4):
-        ws2.cell(row=1, column=c).fill = _HEADER_FILL
-        ws2.cell(row=1, column=c).font = _HEADER_FONT
-    total = max(1, len(rows))
-    for k in ("auto", "review", "low", "not_found"):
-        if cnt.get(k):
-            ws2.append([k, cnt[k], f"{cnt[k] / total:.1%}"])
-    ws2.append(["ВСЕГО", len(rows), "100%"])
-    wb.save(out_path)
+    headers = ["" if x is None else str(x).strip() for x in header]
 
+    id_idx = _find_column(headers, id_column)
+    type_idx = _find_column(headers, type_column)
+    name_idx = _find_column(headers, name_column)
 
-# --------------------------------------------------------------------------
-# Кэш
-# --------------------------------------------------------------------------
+    result = []
+
+    for row_no, row in enumerate(rows, start=2):
+        max_idx = max(id_idx, type_idx, name_idx)
+        if max_idx >= len(row):
+            # Не теряем строку из-за отсутствующего хвостового значения.
+            # Но без ID невозможно однозначно идентифицировать запись.
+            raise ValueError(
+                f"Строка Excel {row_no} короче ожидаемой структуры."
+            )
+
+        record_id = row[id_idx]
+        tip_org = row[type_idx]
+        name = row[name_idx]
+
+        record_id = "" if record_id is None else str(record_id).strip()
+        tip_org = "" if tip_org is None else str(tip_org).strip()
+        name = "" if name is None else str(name).strip()
+
+        result.append((row_no, record_id, tip_org, name))
+
+    wb.close()
+    return result
+
 def load_cache(path):
-    if Path(path).exists():
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def save_cache(path, cache):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=0)
-    Path(tmp).replace(path)
+    p = Path(path)
+    tmp = Path(str(p) + ".tmp")
+    tmp.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    tmp.replace(p)
 
 
-# --------------------------------------------------------------------------
-# Главная
-# --------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser(
-        description="Поиск УНП (Беларусь) по названию через ЕГР")
-    ap.add_argument("input", help="Файл со списком названий (xlsx/csv)")
-    ap.add_argument("--column", default="1",
-                    help="Имя столбца или его номер (1-индекс). По умолч. 1")
-    ap.add_argument("--output", default="unp_result.xlsx",
-                    help="Файл результата (xlsx)")
-    ap.add_argument("--cache", default="unp_cache.json",
-                    help="Файл кэша для возобновляемого поиска")
-    ap.add_argument("--probe", action="store_true",
-                    help="Отладка: вывести сырой ответ для первой записи")
-    args = ap.parse_args()
+def _cache_key(tip_org, name):
+    """Ключ кэша учитывает тип субъекта и исходное название."""
+    return f"{tip_org}|{name}"
 
-    names = read_names(args.input, args.column)
-    if not names:
-        sys.exit("Список названий пуст — проверьте --column и содержимое файла.")
-    print(f"Загружено названий: {len(names)}")
 
-    cache = load_cache(args.cache)
+def make_rows(records, cache_path="unp_cache.json"):
+    """
+    Основная обработка records.
 
-    if args.probe:
-        sample = names[0][1]
-        print(f"[probe] Тестируем запрос для: {sample!r}", flush=True)
-        egr_search(sample, debug=True)
-        print('[probe] Готово. Если кандидаты пусты — поправьте '
-              'EGR_API_ENDPOINTS/парсер по сырому ответу.')
-        return
+    Правила:
+      ФЛ -> inn_search(), без запроса УНП.
+      Пустой ORG_NAME -> empty_name, строка сохраняется.
+      ЮЛ/ИП -> поиск ЕГР.
+      Ликвидированные организации не исключаются.
+      Несколько кандидатов -> manual_multiple.
+      Найденное название: ИП=VFIO, ЮЛ=VN.
+    """
+    cache = load_cache(cache_path)
+    rows = []
 
-    out_rows = []
-    for idx, (row_no, name) in enumerate(names, start=1):
-        result = cache.get(name)
-        if result is None:
-            try:
-                cands = egr_search(name)
-            except Exception as e:
-                cands = []
-                print(f"  ! ошибка запроса для «{name}»: {e}")
-            best, score, ranked = (best_match(name, cands) if cands
-                                   else (None, 0.0, []))
-            decision = decide(score) if best else "not_found"
+    for rec in records:
+        # print("Тип rec:", type(rec), "Содержимое:", rec) # Временная строка для отладки
+        row_number, record_id, tip_org, name = rec
+        tip_org = str(tip_org or "").strip().upper()
+        name = str(name or "").strip()       
+        # row_number = rec.get("row_number", "")
+        # record_id = rec.get("id", "")      
+        # tip_org = str(rec.get("tip_org", "") or "").strip().upper()
+        # name = str(rec.get("org_name", "") or "").strip()
+
+        # Пустое наименование
+        if not name:
+            rows.append({
+                "ID": record_id,
+                "TIP_ORG": tip_org,
+                "ORG_NAME": name,
+                "УНП": "",
+                "Найденное название": "",
+                "Статус": "",
+                "Балл": 0.0,
+                "Решение": "empty_name",
+                "Источник": "",
+            })
+            continue
+
+        # Физическое лицо: УНП не ищем.
+        if tip_org == "ФЛ":
+            inn_search(name)
+
+            rows.append({
+                "ID": record_id,
+                "TIP_ORG": tip_org,
+                "ORG_NAME": name,
+                "УНП": "",
+                "Найденное название": "",
+                "Статус": "",
+                "Балл": 0.0,
+                "Решение": "inn_search",
+                "Источник": "",
+            })
+            continue
+
+        # ЮЛ / ИП
+        search_query = normalize(name, tip_org)
+
+        if not search_query:
+            rows.append({
+                "ID": record_id,
+                "TIP_ORG": tip_org,
+                "ORG_NAME": name,
+                "УНП": "",
+                "Найденное название": "",
+                "Статус": "",
+                "Балл": 0.0,
+                "Решение": "not_found",
+                "Источник": "",
+            })
+            continue
+
+        # Кэш
+        cache_key = f"{tip_org}|{search_query}"
+
+        if cache_key in cache:
+            candidates = cache[cache_key]
+            source = "кэш"
+        else:
+            candidates = egr_search(search_query)
+            cache[cache_key] = candidates
+            source = "запрос ЕГР"
+
+        # Выбор
+        best, score, ranked = best_match(
+            name,
+            candidates,
+            tip_org
+        )
+
+        if best is not None:
+            decision = "auto"
+            unp = best.get("unp", "")
+            found_name = best.get("name", "")
+            status = best.get("status", "")
+            result_score = best.get("score", score)
+
+        elif ranked:
+            decision = "manual_multiple"
+            unp = ""
+            found_name = ""
+            status = ""
+            result_score = score
+
+        else:
+            decision = "not_found"
+            unp = ""
+            found_name = ""
+            status = ""
+            result_score = 0.0
+
+        rows.append({
+            "ID": record_id,
+            "TIP_ORG": tip_org,
+            "ORG_NAME": name,
+            "УНП": unp,
+            "Найденное название": found_name,
+            "Статус": status,
+            "Балл": round(result_score, 1),
+            "Решение": decision,
+            "Источник": source,
+        })
+
+    save_cache(cache_path, cache)
+    return rows
+
+def test_single_record(records, row_number, cache_path="unp_cache.json"):
+    """
+    Тестовый режим для одной строки Excel.
+
+    row_number — фактический номер строки Excel, включая строку заголовка.
+    Запрос выполняется только для выбранной строки.
+    Результат возвращается в том же формате 9 колонок, что и result.xlsx.
+    """
+    selected = [r for r in records if r[0] == row_number]
+
+    if not selected:
+        raise ValueError(
+            f"Строка Excel {row_number} не найдена."
+        )
+
+    row = selected[0]
+    row_no, record_id, tip_org, name = row
+
+    print("\n=== ТЕСТ ОДНОЙ СТРОКИ ===")
+    print("Строка Excel:", row_no)
+    print("ID:", record_id)
+    print("TIP_ORG:", tip_org)
+    print("ORG_NAME:", name)
+
+    if str(tip_org).strip().upper() not in ("ЮЛ", "ИП"):
+        raise ValueError(
+            "Тестовый режим для одной строки предназначен для ЮЛ или ИП."
+        )
+
+    if not name or name == "#нет#":
+        result = {
+            "unp": "",
+            "matched": "",
+            "status": "",
+            "score": 0.0,
+            "decision": "empty_name",
+            "candidates": [],
+            "error": "",
+        }
+        search_query = ""
+    else:
+        search_query = normalize(name, tip_org)
+        print("Нормализованный поисковый запрос:", search_query)
+        cache = load_cache(cache_path)
+        key = _cache_key(tip_org, name)
+
+        # В тестовом режиме кэш используем, но явно показываем это.
+        if key in cache:
+            print("Источник результата: кэш")
+            result = cache[key]
+        else:
+            print("Источник результата: запрос ЕГР")
+            candidates = egr_search(search_query, debug=True)
+            best, score, ranked = best_match(
+                name,
+                candidates,
+                tip_org,
+            )
+
+            if best is not None:
+                decision = decide(score)
+                unp = best.get("unp", "")
+                matched = best.get("name", "")
+                status = best.get("status", "")
+            elif ranked:
+                decision = "manual_multiple"
+                unp = ""
+                matched = ""
+                status = ""
+            else:
+                decision = "not_found"
+                unp = ""
+                matched = ""
+                status = ""
+
             result = {
-                "unp": best["unp"] if best else "",
-                "matched": best["name"] if best else "",
-                "status": (best["status"] if best and best.get("status") else ""),
+                "unp": unp,
+                "matched": matched,
+                "status": status,
                 "score": score,
                 "decision": decision,
                 "candidates": ranked,
+                "error": "",
             }
-            cache[name] = result
-            if idx % 10 == 0 or idx == len(names):
-                save_cache(args.cache, cache)
-            time.sleep(EGR_DELAY)
 
-        cands_str = " ; ".join(
-            f"{c['unp']} | {c['name']} | {c['score']}"
-            for c in result.get("candidates", []))
-        out_rows.append([
-            row_no, name, result["unp"], result["matched"],
-            result["status"], result["score"], result["decision"], cands_str,
+            cache[key] = result
+            save_cache(cache_path, cache)
+
+    result_row = [
+        record_id,
+        tip_org,
+        name,
+        search_query,
+        result.get("unp", ""),
+        result.get("matched", ""),
+        result.get("status", ""),
+        result.get("score", 0),
+        result.get("decision", ""),
+    ]
+
+    print("\n=== РЕЗУЛЬТАТ ===")
+    print("УНП:", result_row[4] or "—")
+    print("Найденное название:", result_row[5] or "—")
+    print("Статус:", result_row[6] or "—")
+    print("Балл:", result_row[7])
+    print("Решение:", result_row[8])
+
+    print("\n=== КАНДИДАТЫ ===")
+    if result.get("candidates"):
+        for n, candidate in enumerate(result["candidates"], start=1):
+            print(
+                f"{n}. УНП={candidate.get('unp','')} | "
+                f"Название={candidate.get('name','')} | "
+                f"Балл={candidate.get('score',0)} | "
+                f"Статус={candidate.get('status','')}"
+            )
+    else:
+        print("Кандидатов нет.")
+
+    return [result_row]
+
+def write_excel(rows, output):
+    """Записать рабочий результат поиска УНП."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "УНП"
+
+    headers = [
+        "ID",
+        "Тип",
+        "Исходное название",
+        "Поисковый запрос",
+        "УНП",
+        "Найденное название",
+        "Статус",
+        "Балл",
+        "Решение",
+    ]
+    ws.append(headers)
+
+    header_fill = PatternFill("solid", fgColor="305496")
+    header_font = Font(color="FFFFFF", bold=True)
+
+    fills = {
+        "auto": PatternFill("solid", fgColor="C6EFCE"),
+        "review": PatternFill("solid", fgColor="FFEB9C"),
+        "low": PatternFill("solid", fgColor="FFC7CE"),
+        "not_found": PatternFill("solid", fgColor="FFC7CE"),
+        "error": PatternFill("solid", fgColor="FFC7CE"),
+        "empty_name": PatternFill("solid", fgColor="D9E1F2"),
+    }
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(wrap_text=True)
+    for row in rows:
+        ws.append([
+            row.get("ID", ""),
+            row.get("TIP_ORG", ""),
+            row.get("Исходное название", ""),
+            row.get("Поисковый запрос", ""),
+            row.get("УНП", ""),
+            row.get("Найденное название", ""),
+            row.get("Статус", ""),
+            row.get("Балл", ""),
+            row.get("Решение", ""),
         ])
-        bar = ("OK " if result["decision"] == "auto"
-               else ("?  " if result["decision"] == "review" else "-- "))
-        print(f"{bar}{idx}/{len(names)}  {result['decision']:>9}  "
-              f"{result['score']:>5}  {result['unp'] or '—':<9}  {name[:40]}")
+        # ws.append(row) - openpyxl при ws.append(dict) воспринимает ключи словаря как имена Excel-колонок.
+        fill = fills.get(row.get("Решение", ""))
+        # fill = fills.get(row[8]) взять элемент с индексом 8 - взять значение по ключу "Решение".
+        if fill:
+            for cell in ws[ws.max_row]:
+                cell.fill = fill
 
-    save_cache(args.cache, cache)
-    write_excel(out_rows, args.output)
-    found = sum(1 for r in out_rows if r[6] in ("auto", "review"))
-    print(f"\nГотово. Найдено (auto+review): {found}/{len(out_rows)}  →  {args.output}")
+    widths = [18, 10, 55, 55, 15, 55, 20, 10, 14]
+    for i, width in enumerate(widths, start=1):
+        ws.column_dimensions[
+            openpyxl.utils.get_column_letter(i)
+        ].width = width
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    # Сводка сохраняет информацию о том, что произошло при обработке.
+    summary = wb.create_sheet("Сводка")
+    from collections import Counter
+
+    # counter = Counter(row[8] for row in rows)
+    counter = Counter(row["Решение"] for row in rows)
+    summary.append(["Решение", "Количество", "Доля"])
+    total = len(rows)
+
+    for key in ("auto", "review", "low", "not_found", "empty_name", "error"):
+        if counter[key]:
+            summary.append([
+                key,
+                counter[key],
+                f"{counter[key] / total:.1%}" if total else "0%",
+            ])
+
+    summary.append(["ВСЕГО", total, "100%"])
+
+    wb.save(output)
+    
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input", help="input.xlsx")
+    parser.add_argument("--id-column", default="id_r_raspost")
+    parser.add_argument("--type-column", default="TIP_ORG")
+    parser.add_argument("--name-column", default="ORG_NAME")
+    parser.add_argument("--output", default="result.xlsx")
+    parser.add_argument("--cache", default="unp_cache.json")
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="Показать сырой ответ API для первой непустой строки.",
+    )
+    parser.add_argument(
+        "--test-row",
+        type=int,
+        default=None,
+        help="Тестировать одну конкретную строку Excel (номер строки, включая заголовок).",
+    )
+    parser.add_argument(
+        "--test-output",
+        default="result_test.xlsx",
+        help="Файл результата тестового режима.",
+    )
+    args = parser.parse_args()
+
+    records = read_names(
+        args.input,
+        id_column=args.id_column,
+        type_column=args.type_column,
+        name_column=args.name_column,
+    )
+    print(f"Будет обработано строк: {len(records)}")
+
+    if args.probe:
+        if not records:
+            raise SystemExit("Нет строк для теста.")
+
+        # Ищем первую строку с непустым названием.
+        probe_record = next(
+            (record for record in records if record[3] and record[3] != "#нет#"),
+            None,
+        )
+        if probe_record is None:
+            raise SystemExit("Нет непустых ORG_NAME для теста.")
+
+        print("ID:", probe_record[1])
+        print("Тип:", probe_record[2])
+        print("Тест:", probe_record[3])
+        egr_search(probe_record[3], debug=True)
+        return
+
+    if args.test_row is not None:
+        rows = test_single_record(
+            records,
+            args.test_row,
+            args.cache,
+        )
+        write_excel(rows, args.test_output)
+        print("\nТестовый result.xlsx не перезаписывается.")
+        print("Результат теста:", args.test_output)
+        return
+
+    rows = make_rows(records, args.cache)
+    write_excel(rows, args.output)
+    
+    found = sum(row["Решение"] in ("auto", "review") for row in rows)
+    empty = sum(row["Решение"] == "empty_name" for row in rows)
+
+    # found = sum(row[8] in ("auto", "review") for row in rows)
+    # empty = sum(row[8] == "empty_name" for row in rows)
+
+    print(f"\nГотово: {found}/{len(rows)} найдено.")
+    print(f"Пустых названий: {empty}")
+    print("Результат:", args.output)
 
 
 if __name__ == "__main__":
     main()
-
