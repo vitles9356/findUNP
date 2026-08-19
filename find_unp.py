@@ -395,6 +395,91 @@ def egr_search(name, debug=False):
 
     raise RuntimeError(last_error or "Неизвестная ошибка запроса ЕГР")
 
+def egr_search_by_words(search_query, cache):
+    """
+    Дополнительный поиск кандидатов ЮЛ по отдельным словам
+    поискового запроса.
+
+    Функция предназначена только для случая, когда обычный
+    egr_search(search_query) вернул пустой список.
+
+    Функция НЕ:
+      - рассчитывает score;
+      - вызывает best_match();
+      - принимает решение auto/review/low/manual_multiple;
+      - изменяет исходный поисковый запрос.
+
+    Она только:
+      1. разбирает search_query на слова;
+      2. выполняет поиск по каждому слову;
+      3. объединяет найденных кандидатов;
+      4. удаляет дубли по УНП;
+      5. сохраняет результаты отдельных запросов в cache.
+
+    Параметры:
+      search_query -- исходный поисковый запрос;
+      cache        -- словарь существующего кэша.
+
+    Возвращает:
+      объединённый список кандидатов.
+    """
+
+    search_query = str(search_query or "").strip()
+
+    # Пустой запрос
+    if not search_query:
+        return []
+
+    # Разбираем исходный запрос на слова.
+    words = search_query.split()
+
+    # Если слово только одно, дополнительный поиск
+    # не имеет смысла: исходный поиск уже был выполнен.
+    if len(words) <= 1:
+        return []
+
+    # Словарь:
+    #   ключ   = УНП
+    #   значение = полный объект кандидата,
+    #               возвращённый egr_search()
+    candidates_by_unp = {}
+
+    for word in words:
+
+        # Кэш отдельного поискового запроса.
+        #
+        # Используем отдельный ключ, чтобы запрос
+        # "ЮЛ|торцовых" не смешивался с исходным
+        # "ЮЛ|нпп завод торцовых уплотнений".
+        cache_key = f"ЮЛ|{word}"
+
+        if cache_key in cache:
+            candidates = cache[cache_key]
+        else:
+            candidates = egr_search(word)
+            cache[cache_key] = candidates
+
+        # Если по отдельному слову ничего не найдено,
+        # просто переходим к следующему слову.
+        if not candidates:
+            continue
+
+        # Добавляем кандидатов в общий список.
+        # УНП уникален, поэтому используем его
+        # для удаления дублей.
+        for candidate in candidates:
+
+            unp = str(candidate.get("unp", "") or "").strip()
+
+            # Кандидат без УНП не имеет смысла для
+            # последующего выбора.
+            if not unp:
+                continue
+
+            if unp not in candidates_by_unp:
+                candidates_by_unp[unp] = candidate
+
+    return list(candidates_by_unp.values())
 
 def candidate_name(candidate, tip_org):
     """Название кандидата, используемое для сопоставления и вывода."""
