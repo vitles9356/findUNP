@@ -524,7 +524,7 @@ def candidate_name(candidate, tip_org):
 
 def best_match(input_name, candidates, tip_org):
     """
-    Выбор кандидата.
+    1.Выбор кандидата.
 
     ИП:
       - только VFIO;
@@ -536,6 +536,15 @@ def best_match(input_name, candidates, tip_org):
 
     ЮЛ:
       - существующий fuzzy-механизм по VN.
+    
+    2.Выбирает лучшего кандидата из нескольких по score.
+    Возвращает:
+        best       - лучший кандидат либо None
+        second     - ближайший конкурент либо None
+        best_score - score лучшего кандидата
+        margin     - разница между первым и вторым кандидатом
+
+    Для одного кандидата margin = None.
     """
     tip_org = str(tip_org or "").strip().upper()
 
@@ -627,13 +636,21 @@ def best_match(input_name, candidates, tip_org):
             "score": round(score, 1),
         })
 
-    ranked.sort(key=lambda x: x["score"], reverse=True)
+    ranked.sort(key=lambda x: x[0], reverse=True)
 
     if not ranked:
-        return None, 0.0, []
+        return None, None, 0.0, None
 
-    best = ranked[0]
-    return best, best["score"], ranked[:5]
+    best_score, best = ranked[0]
+
+    if len(ranked) > 1:
+        second_score, second = ranked[1]
+        margin = best_score - second_score
+    else:
+        second = None
+        margin = None
+
+    return best, second, best_score, margin
 
 def decide(score):
     if score >= SCORE_ACCEPT:
