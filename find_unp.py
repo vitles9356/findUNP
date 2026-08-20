@@ -23,6 +23,16 @@
 egr.gov.by (например, из белорусской сети). Используйте ключ --probe, чтобы
 посмотреть "сырой" ответ сервера и при необходимости подкорректировать парсер.
 
+Изменения для дополнительного поиска при получении нулевого результата первоначального запроса
+# 1. Сначала выполняется обычный поиск egr_search(search_query).
+# 2. Если он вернул 0 кандидатов и это ЮЛ, выполняется
+#    дополнительный egr_search_by_words(search_query, cache).
+# 3. Дополнительный поиск НЕ меняет поисковый запрос.
+# 4. Все найденные кандидаты снова проходят через тот же best_match().
+# 5. Если дополнительный поиск также ничего не дал -> not_found.
+# 6. Если найден кандидат -> решение определяется обычным decide(score).
+# 7. В поле "Источник" фиксируется, каким способом получен результат.
+
 Установка зависимостей:
     pip install requests openpyxl rapidfuzz
 
@@ -233,6 +243,7 @@ def debug_ip_candidates(input_name, candidates):
     return matches
 def normalize(name, tip_org):
     """Нормализация поискового запроса."""
+    # print("->normalize(): ",name)
     if not name:
         return ""
 
@@ -243,7 +254,7 @@ def normalize(name, tip_org):
     for lf in LEGAL_FORMS:
         s = re.sub(rf"\b{re.escape(lf)}\b", " ", s)
 
-    s = re.sub(r"[^\w\s.-]", " ", s, flags=re.UNICODE)
+    s = re.sub(r"[^\w\s.№-]", " ", s, flags=re.UNICODE)
     s = WS_RE.sub(" ", s).strip()
 
     # Для ИП: первое слово — фамилия; инициалы после фамилии отбрасываем.
@@ -260,7 +271,7 @@ def normalize(name, tip_org):
                     continue
                 result.append(word)
             s = " ".join(result)
-
+    # print("normalize()->: ",s.strip())
     return s.strip()
 
 def _as_dict_list(data):
@@ -423,16 +434,29 @@ def egr_search_by_words(search_query, cache):
     Возвращает:
       объединённый список кандидатов.
     """
-
+    # print("Исходный запрос egr_search_by_words:", type(search_query), search_query)
     search_query = str(search_query or "").strip()
 
     # Пустой запрос
     if not search_query:
         return []
 
-    # Разбираем исходный запрос на слова.
-    words = search_query.split()
 
+    # 1. РАБОТАЕМ СО СТРОКОЙ: Разделяем точку, если после нее идет буква (г.Могилеве -> г. Могилеве)
+    prepared_query = re.sub(r'\.(?=[^\s])', '. ', search_query)
+
+    # 2. РАБОТАЕМ СО СТРОКОЙ: Сохраняем буквы, цифры, пробелы, точки, а также знаки: №, / и -
+    clean_query = re.sub(r'[^\w\s.№/\-]', ' ', prepared_query)
+
+    # 3. ТОЛЬКО ТЕПЕРЬ разбиваем очищенную строку по пробелам
+    raw_words = clean_query.split()
+
+    # 4. Применяем правила фильтрации:
+    # - длина больше 1 символа
+    # - не заканчивается на точку
+    words = [w for w in raw_words if len(w) > 1 and not w.endswith('.')]
+    # print("Результат фильтрации egr_search_by_words:", words)
+    
     # Если слово только одно, дополнительный поиск
     # не имеет смысла: исходный поиск уже был выполнен.
     if len(words) <= 1:
@@ -456,8 +480,13 @@ def egr_search_by_words(search_query, cache):
         if cache_key in cache:
             candidates = cache[cache_key]
         else:
-            candidates = egr_search(word)
-            cache[cache_key] = candidates
+            try:
+                candidates = egr_search(word)
+                cache[cache_key] = candidates
+            except TypeError as e:
+                print("\n!!! КРИТИЧЕСКАЯ ОШИБКА ВНУТРИ egr_search !!!")
+                print(f"Сбой произошло на слове: '{word}' (тип: {type(word)})")
+                raise e
 
         # Если по отдельному слову ничего не найдено,
         # просто переходим к следующему слову.
@@ -718,15 +747,13 @@ def make_rows(records, cache_path="unp_cache.json"):
     Правила:
       ФЛ -> inn_search(), без запроса УНП.
       Пустой ORG_NAME -> empty_name, строка сохраняется.
-      ЮЛ/ИП -> поиск ЕГР.
+      ЮЛ/ИП -> обычный поиск ЕГР.
+      Если обычный поиск ЮЛ дал 0 кандидатов ->
+          дополнительный поиск по отдельным словам
+          через egr_search_by_words().
       Ликвидированные организации не исключаются.
       Несколько кандидатов -> manual_multiple.
       Найденное название: ИП=VFIO, ЮЛ=VN.
-
-    В результат сохраняются:
-      - исходное название;
-      - поисковый запрос;
-      - кандидаты для manual_multiple в поле "Решение".
     """
     cache = load_cache(cache_path)
     rows = []
@@ -796,7 +823,7 @@ def make_rows(records, cache_path="unp_cache.json"):
             continue
 
         # ---------------------------------------------------------
-        # Кэш
+        # Первоначальный поиск / кэш
         # ---------------------------------------------------------
         cache_key = f"{tip_org}|{search_query}"
 
@@ -807,6 +834,30 @@ def make_rows(records, cache_path="unp_cache.json"):
             candidates = egr_search(search_query)
             cache[cache_key] = candidates
             source = "запрос ЕГР"
+
+        # ---------------------------------------------------------
+        # ДОПОЛНИТЕЛЬНЫЙ ПОИСК
+        #
+        # Выполняется только если:
+        #   - тип организации ЮЛ;
+        #   - первоначальный поиск дал 0 кандидатов.
+        #
+        # egr_search_by_words() сама использует кэш для каждого
+        # отдельного слова.
+        # ---------------------------------------------------------
+        if tip_org == "ЮЛ" and not candidates:
+            word_candidates = egr_search_by_words(
+                search_query,
+                cache
+            )
+
+            if word_candidates:
+                candidates = word_candidates
+                source = "дополнительный поиск по словам"
+            else:
+                # Первоначальный и дополнительный поиск
+                # результатов не дали.
+                source = "поиск ЕГР + поиск по словам"
 
         # ---------------------------------------------------------
         # Выбор кандидата
@@ -821,10 +872,6 @@ def make_rows(records, cache_path="unp_cache.json"):
         # Однозначно найден кандидат
         # ---------------------------------------------------------
         if best is not None:
-            # Решение зависит от балла:
-            # >= SCORE_ACCEPT -> auto
-            # >= SCORE_REVIEW -> review
-            # иначе -> low
             decision = decide(score)
 
             unp = best.get("unp", "")
@@ -847,10 +894,6 @@ def make_rows(records, cache_path="unp_cache.json"):
                     f"Статус={candidate.get('status', '')}"
                 )
 
-            # decision = (
-            #     "manual_multiple: "
-            #    + "; ".join(candidate_text)
-            #)
             decision = (
                 "manual_multiple:\n"
                 + "\n".join(candidate_text)
@@ -866,7 +909,6 @@ def make_rows(records, cache_path="unp_cache.json"):
         # ---------------------------------------------------------
         else:
             decision = "not_found"
-
             unp = ""
             found_name = ""
             status = ""
@@ -889,7 +931,6 @@ def make_rows(records, cache_path="unp_cache.json"):
         })
 
     save_cache(cache_path, cache)
-
     return rows
 
 def test_single_record(records, row_number, cache_path="unp_cache.json"):
