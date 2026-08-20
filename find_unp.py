@@ -522,7 +522,7 @@ def candidate_name(candidate, tip_org):
     return ""
 
 
-def best_match(input_name, candidates, tip_org):
+def best_match(candidates, query, tip_org):
     """
     1.Выбор кандидата.
 
@@ -879,9 +879,9 @@ def make_rows(records, cache_path="unp_cache.json"):
         # ---------------------------------------------------------
         # Выбор кандидата
         # ---------------------------------------------------------
-        best, score, ranked = best_match(
-            name,
+        best, second, score, margin = best_match(
             candidates,
+            search_query,
             tip_org
         )
 
