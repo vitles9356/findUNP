@@ -525,30 +525,37 @@ def candidate_name(candidate, tip_org):
 
 def best_match(candidates, query, tip_org):
     """
-    1.Выбор кандидата.
+    Выбор лучшего кандидата.
 
-    ИП:
-      - только VFIO;
-      - перед разбором ФИО удаляется правовая форма "ИП";
-      - строгое совпадение фамилии и инициалов;
-      - 0 -> not_found;
-      - 1 -> auto;
-      - >1 -> manual_multiple.
-
-    ЮЛ:
-      - существующий fuzzy-механизм по VN.
-    
-    2.Выбирает лучшего кандидата из нескольких по score.
-    Возвращает:
+    Возвращает 4 значения:
         best       - лучший кандидат либо None
         second     - ближайший конкурент либо None
         best_score - score лучшего кандидата
         margin     - разница между первым и вторым кандидатом
 
-    Для одного кандидата margin = None.
+    Для одного кандидата:
+        second = None
+        margin = None
+
+    ИП:
+        - используется только VFIO;
+        - из входного запроса удаляется "ИП";
+        - сравниваются фамилия и инициалы;
+        - учитываются только кандидаты с полным совпадением
+          фамилии и инициалов;
+        - совпадение получает score = 100.
+
+    ЮЛ:
+        - используется VN;
+        - применяется существующий fuzzy-механизм
+          token_sort_ratio().
     """
     tip_org = str(tip_org or "").strip().upper()
+    query = str(query or "").strip()
 
+    # -------------------------------------------------------------
+    # ИП
+    # -------------------------------------------------------------
     if tip_org == "ИП":
 
         def fio_parts(value):
@@ -558,9 +565,10 @@ def best_match(candidates, query, tip_org):
             s = str(value).strip().lower().replace("ё", "е")
             s = re.sub(r"\s+", " ", s)
 
-            # Для входного значения "ИП Вишнякова Т.В."
-            # удаляем правовую форму ИП перед разбором ФИО.
+            # "ИП Вишнякова Т.В." -> "Вишнякова Т.В."
             words = s.replace(",", " ").split()
+
+            # Правовая форма может находиться в начале строки.
             if words and words[0] == "ип":
                 words = words[1:]
 
@@ -571,25 +579,28 @@ def best_match(candidates, query, tip_org):
             initials = ""
 
             for word in words[1:]:
-                # Готовые инициалы: Т.В., Т. В., Т.В
+                # Готовые инициалы: Т.В., Т.В, Т. В.
                 if "." in word:
                     letters = re.findall(r"[а-яa-z]", word)
                     initials += "".join(letters)
                     continue
 
-                # Полное имя/отчество: Татьяна -> Т
+                # Полное имя/отчество:
+                # Татьяна -> Т, Викторовна -> В
                 letters = re.findall(r"[а-яa-z]", word)
                 if letters:
                     initials += letters[0]
 
             return surname, initials
 
-        input_surname, input_initials = fio_parts(input_name)
+        input_surname, input_initials = fio_parts(query)
+
         matched = []
 
-        for candidate in candidates:
+        for candidate in candidates or []:
             vfio = candidate.get("vfio", "") or ""
 
+            # Для ИП без ФИО кандидата не рассматриваем.
             if not vfio:
                 continue
 
@@ -607,19 +618,32 @@ def best_match(candidates, query, tip_org):
                 })
 
         if not matched:
-            return None, 0.0, []
+            return None, None, 0.0, None
 
-        if len(matched) == 1:
-            return matched[0], 100.0, matched
+        # Сначала лучший кандидат. Все точные совпадения ИП
+        # имеют score=100, поэтому при нескольких кандидатах
+        # margin будет 0.
+        matched.sort(key=lambda x: x["score"], reverse=True)
 
-        # Несколько кандидатов: ничего автоматически не выбираем.
-        return None, 100.0, matched
+        best = matched[0]
+        best_score = best["score"]
 
-    # ЮЛ: существующий fuzzy-механизм по VN
-    norm_in = normalize(input_name, tip_org)
+        if len(matched) > 1:
+            second = matched[1]
+            margin = best_score - second["score"]
+        else:
+            second = None
+            margin = None
+
+        return best, second, best_score, margin
+
+    # -------------------------------------------------------------
+    # ЮЛ
+    # -------------------------------------------------------------
+    norm_in = normalize(query, tip_org)
     ranked = []
 
-    for candidate in candidates:
+    for candidate in candidates or []:
         match_name = candidate_name(candidate, tip_org)
 
         if not match_name:
@@ -637,16 +661,19 @@ def best_match(candidates, query, tip_org):
             "score": round(score, 1),
         })
 
-    ranked.sort(key=lambda x: x[0], reverse=True)
+    # ВАЖНО: ranked содержит словари, поэтому сортируем
+    # по полю "score", а не по x[0].
+    ranked.sort(key=lambda x: x["score"], reverse=True)
 
     if not ranked:
         return None, None, 0.0, None
 
-    best_score, best = ranked[0]
+    best = ranked[0]
+    best_score = best["score"]
 
     if len(ranked) > 1:
-        second_score, second = ranked[1]
-        margin = best_score - second_score
+        second = ranked[1]
+        margin = round(best_score - second["score"], 1)
     else:
         second = None
         margin = None
