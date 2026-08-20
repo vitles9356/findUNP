@@ -73,8 +73,9 @@ EGR_TIMEOUT = 30
 EGR_DELAY = 0.5
 EGR_RETRIES = 3
 
-SCORE_ACCEPT = 92
-SCORE_REVIEW = 70
+SCORE_ACCEPT = 90
+SCORE_REVIEW = 75
+SCORE_MARGIN = 10
 
 LEGAL_FORMS = [
     "ооо",
@@ -769,7 +770,17 @@ def make_rows(records, cache_path="unp_cache.json"):
           дополнительный поиск по отдельным словам
           через egr_search_by_words().
       Ликвидированные организации не исключаются.
-      Несколько кандидатов -> manual_multiple.
+
+      Выбор кандидата:
+        - один кандидат:
+            score >= SCORE_ACCEPT -> auto
+            score >= SCORE_REVIEW -> review
+            иначе -> low
+        - несколько кандидатов:
+            score >= SCORE_ACCEPT AND margin >= SCORE_MARGIN -> auto
+            score >= SCORE_REVIEW -> review
+            иначе -> low
+
       Найденное название: ИП=VFIO, ЮЛ=VN.
     """
     cache = load_cache(cache_path)
@@ -858,9 +869,6 @@ def make_rows(records, cache_path="unp_cache.json"):
         # Выполняется только если:
         #   - тип организации ЮЛ;
         #   - первоначальный поиск дал 0 кандидатов.
-        #
-        # egr_search_by_words() сама использует кэш для каждого
-        # отдельного слова.
         # ---------------------------------------------------------
         if tip_org == "ЮЛ" and not candidates:
             word_candidates = egr_search_by_words(
@@ -872,12 +880,20 @@ def make_rows(records, cache_path="unp_cache.json"):
                 candidates = word_candidates
                 source = "дополнительный поиск по словам"
             else:
-                # Первоначальный и дополнительный поиск
-                # результатов не дали.
                 source = "поиск ЕГР + поиск по словам"
 
         # ---------------------------------------------------------
         # Выбор кандидата
+        #
+        # best_match() должен возвращать:
+        #   best, second, score, margin
+        #
+        # Для одного кандидата:
+        #   second = None
+        #   margin = None
+        #
+        # Для нескольких кандидатов:
+        #   margin = score(best) - score(second)
         # ---------------------------------------------------------
         best, second, score, margin = best_match(
             candidates,
@@ -886,43 +902,34 @@ def make_rows(records, cache_path="unp_cache.json"):
         )
 
         # ---------------------------------------------------------
-        # Однозначно найден кандидат
+        # Кандидат найден
         # ---------------------------------------------------------
         if best is not None:
-            decision = decide(score)
-
             unp = best.get("unp", "")
             found_name = best.get("name", "")
             status = best.get("status", "")
             result_score = best.get("score", score)
 
-        # ---------------------------------------------------------
-        # Несколько кандидатов
-        # ---------------------------------------------------------
-        elif ranked:
-            candidate_text = []
+            # Один кандидат: достаточно самого score.
+            if second is None:
+                decision = decide(score)
 
-            for i, candidate in enumerate(ranked, start=1):
-                candidate_text.append(
-                    f"{i}) "
-                    f"УНП={candidate.get('unp', '')} | "
-                    f"Название={candidate.get('name', '')} | "
-                    f"Балл={candidate.get('score', 0)} | "
-                    f"Статус={candidate.get('status', '')}"
-                )
-
-            decision = (
-                "manual_multiple:\n"
-                + "\n".join(candidate_text)
-            )
-
-            unp = ""
-            found_name = ""
-            status = ""
-            result_score = score
+            # Несколько кандидатов:
+            # auto только при высоком score И достаточном отрыве
+            # от ближайшего конкурента.
+            else:
+                if (
+                    score >= SCORE_ACCEPT
+                    and margin >= SCORE_MARGIN
+                ):
+                    decision = "auto"
+                elif score >= SCORE_REVIEW:
+                    decision = "review"
+                else:
+                    decision = "low"
 
         # ---------------------------------------------------------
-        # Ничего не найдено
+        # Кандидат не выбран
         # ---------------------------------------------------------
         else:
             decision = "not_found"
