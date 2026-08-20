@@ -64,7 +64,11 @@ import requests
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from rapidfuzz import fuzz
+import ujson
 
+# увидеть, сколько памяти уже съедено
+import os
+import psutil
 
 EGR_BASE_URL = "http://egr.gov.by/api/v2/egr"
 EGR_SEARCH_URL = EGR_BASE_URL + "/getShortInfoByRegName/{name}"
@@ -765,18 +769,32 @@ def load_cache(path):
     if not p.exists():
         return {}
     try:
+        # Открываем файл в режиме потокового чтения
+        with open(p, 'r', encoding='utf-8') as f:
+            return ujson.load(f)
+    except Exception:
+        return {}    
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
 def save_cache(path, cache):
+    # Выведет количество элементов и примерный размер структуры в памяти
+    print(f"save_cache: Элементов в кэше: {len(cache)}")
+    print(f"save_cache: Размер объекта cache: {sys.getsizeof(cache)} байт")
+    
     p = Path(path)
     tmp = Path(str(p) + ".tmp")
-    tmp.write_text(
-        json.dumps(cache, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    
+    # Открываем временный файл на запись в режиме потока
+    with open(tmp, 'w', encoding='utf-8') as f:
+        ujson.dump(cache, f, ensure_ascii=False, indent=2)
+        
     tmp.replace(p)
 
 
@@ -1263,6 +1281,10 @@ def main():
         print("\nТестовый result.xlsx не перезаписывается.")
         print("Результат теста:", args.test_output)
         return
+
+    # увидеть, сколько памяти уже съедено
+    process = psutil.Process(os.getpid())
+    print(f"Потребление памяти ДО make_rows: {process.memory_info().rss / 1024**2:.2f} MB")
 
     rows = make_rows(records, args.cache)
     write_excel(rows, args.output)
